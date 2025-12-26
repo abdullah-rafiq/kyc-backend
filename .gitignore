@@ -1,0 +1,27 @@
+# Node dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-lock.yaml
+#hf_cache/
+
+# Env/config files (secrets)
+.env
+.env.local
+.env.*.local
+
+# Firebase service account (VERY sensitive)
+serviceAccountKey.json
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Logs
+logs
+*.log
+logs/*

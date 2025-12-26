@@ -1,0 +1,11 @@
+flask
+ultralytics
+paddleocr
+paddlepaddle
+deepface
+tf-keras
+opencv-python-headless
+numpy
+pillow
+gunicorn
+python-multipart
