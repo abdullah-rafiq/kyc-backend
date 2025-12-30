@@ -1180,7 +1180,7 @@ app.post('/api/kyc/face', authMiddleware, async (req, res) => {
     // Anti-Spoofing
     let livenessResult = null;
     try {
-      livenessResult = await runKycEngine('liveness', { image: normalizeBase64(selfieImage) });
+      livenessResult = await runKycEngine('liveness', { image: normalizeBase64(resolvedSelfie) });
     } catch (e) {
       console.warn('Liveness check failed (fallback to heuristics):', e?.message ?? String(e));
     }
