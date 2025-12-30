@@ -268,6 +268,10 @@ async function downloadRemoteImageAsBase64(urlString, label) {
       method: 'GET',
       signal: controller.signal,
       redirect: 'follow',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Render KYC Service)',
+        Accept: 'image/*',
+      },
     });
 
     if (!resp.ok) {
@@ -558,13 +562,34 @@ async function runKycEngine(mode, data) {
     const base = String(apiUrl).replace(/\/$/, '');
     const url = `${base}${endpoint}`;
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const resp = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data || {}),
-      });
+      const controller = new AbortController();
+      const timeoutMs = Number.parseInt(process.env.KYC_ENGINE_TIMEOUT_MS || '30000', 10);
+      const resolvedTimeoutMs = Number.isFinite(timeoutMs) ? timeoutMs : 30000;
+      const timer = setTimeout(() => controller.abort(), resolvedTimeoutMs);
 
-      const text = await resp.text();
+      let resp;
+      let text = '';
+      try {
+        resp = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify(data || {}),
+          signal: controller.signal,
+        });
+
+        text = await resp.text();
+      } catch (e) {
+        if (String(e?.name || '').toLowerCase().includes('abort')) {
+          throw new Error(`KYC engine timed out after ${resolvedTimeoutMs}ms for ${url}`);
+        }
+        throw new Error(`KYC engine fetch failed for ${url}: ${e?.message ?? String(e)}`);
+      } finally {
+        clearTimeout(timer);
+      }
+
       let parsed;
       try {
         parsed = JSON.parse(text);
@@ -575,6 +600,8 @@ async function runKycEngine(mode, data) {
       if (resp.ok) {
         return parsed;
       }
+
+      console.warn(`[KYC ${mode}] upstream error status=${resp.status} url=${url} body=${text}`);
 
       if (resp.status >= 500 && resp.status <= 599 && attempt === 0) {
         await new Promise((r) => setTimeout(r, 900));
@@ -1163,7 +1190,7 @@ app.post('/api/kyc/face', authMiddleware, async (req, res) => {
 
     console.log("Verifying Face via Local Engine...");
     const faceResult = await runKycEngine('face', {
-      image: normalizeBase64(resolvedCnic),
+      image1: normalizeBase64(resolvedCnic),
       image2: normalizeBase64(resolvedSelfie),
     });
 
