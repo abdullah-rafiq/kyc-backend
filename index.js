@@ -95,7 +95,28 @@ app.post('/provider/stats/recompute', authMiddleware, async (req, res) => {
     if (providerId !== requesterUid) {
       const role = await getUserRole(requesterUid);
       if (role !== 'admin') {
-        return res.status(403).json({ error: 'Forbidden' });
+        let hasBooking = false;
+        try {
+          const bookingSnap = await db
+            .collection('bookings')
+            .where('customerId', '==', requesterUid)
+            .where('providerId', '==', providerId)
+            .limit(1)
+            .get();
+          hasBooking = !bookingSnap.empty;
+        } catch (_) {
+          // Avoid composite index requirements by falling back to filtering in code.
+          const bookingSnap = await db
+            .collection('bookings')
+            .where('customerId', '==', requesterUid)
+            .limit(50)
+            .get();
+          hasBooking = bookingSnap.docs.some((d) => String(d.get('providerId') || '') === providerId);
+        }
+
+        if (!hasBooking) {
+          return res.status(403).json({ error: 'Forbidden' });
+        }
       }
     }
 
