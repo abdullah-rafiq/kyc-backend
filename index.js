@@ -2,15 +2,31 @@ const express = require('express');
 const cors = require('cors');
 const { InferenceClient, HfInference } = require('@huggingface/inference');
 const admin = require('firebase-admin');
-const fetch = require('node-fetch').default;
+const crypto = require('crypto');
+const querystring = require('querystring');
 const { spawn } = require('child_process');
 const path = require('path');
 require('dotenv').config();
 const app = express();
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ limit: '20mb', extended: true }));
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '30mb' }));
+app.use(express.urlencoded({ limit: '30mb', extended: true }));
 app.use(cors());
-app.use(express.json());
+
+app.use((err, req, res, next) => {
+  if (err && (err.type === 'entity.too.large' || err.status === 413)) {
+    return res.status(413).json({
+      error: 'Payload too large. Reduce image size or increase server body limit.',
+      errorCode: 'PAYLOAD_TOO_LARGE',
+    });
+  }
+  return next(err);
+});
+
+const fetch = globalThis.fetch;
+if (typeof fetch !== 'function') {
+  throw new Error('Global fetch is not available. Please run this service on Node.js >= 18.');
+}
 
 const firebaseServiceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT;
 const firebaseServiceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
@@ -51,6 +67,206 @@ const authMiddleware = async (req, res, next) => {
   }
 };
 
+async function getUserRole(uid) {
+  if (!uid) return null;
+  try {
+    const snap = await db.collection('users').doc(String(uid)).get();
+    if (!snap.exists) return null;
+    const role = snap.get('role');
+    return typeof role === 'string' ? role : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+app.post('/provider/stats/recompute', authMiddleware, async (req, res) => {
+  try {
+    const requesterUid = req.user?.uid;
+    if (!requesterUid) {
+      return res.status(401).json({ error: 'Unauthorized: Invalid token' });
+    }
+
+    const rawProviderId = req.body?.providerId;
+    const providerId = String(rawProviderId || requesterUid).trim();
+    if (!providerId) {
+      return res.status(400).json({ error: 'providerId is required' });
+    }
+
+    if (providerId !== requesterUid) {
+      const role = await getUserRole(requesterUid);
+      if (role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    }
+
+    const servicesSnap = await db
+      .collection('services')
+      .where('providerId', '==', providerId)
+      .get();
+
+    let minActive = null;
+    let minAny = null;
+    for (const doc of servicesSnap.docs) {
+      const data = doc.data() || {};
+      const p = Number(data.basePrice || 0);
+      if (!Number.isFinite(p) || p <= 0) continue;
+      if (minAny == null || p < minAny) minAny = p;
+      if (data.isActive !== false) {
+        if (minActive == null || p < minActive) minActive = p;
+      }
+    }
+    const minPrice = minActive ?? minAny;
+
+    const reviewsSnap = await db
+      .collection('reviews')
+      .where('providerId', '==', providerId)
+      .get();
+
+    let ratingTotal = 0;
+    let ratingCount = 0;
+    for (const doc of reviewsSnap.docs) {
+      const data = doc.data() || {};
+      const r = Number(data.rating || 0);
+      if (!Number.isFinite(r) || r <= 0) continue;
+      ratingTotal += r;
+      ratingCount += 1;
+    }
+    const avgRating = ratingCount > 0 ? ratingTotal / ratingCount : 0;
+
+    const bookingsSnap = await db
+      .collection('bookings')
+      .where('providerId', '==', providerId)
+      .get();
+
+    let completedJobs = 0;
+    for (const doc of bookingsSnap.docs) {
+      const data = doc.data() || {};
+      if (String(data.status || '') === 'Completed') {
+        completedJobs += 1;
+      }
+    }
+
+    const publicStats = {
+      minPrice: minPrice == null ? null : minPrice,
+      avgRating,
+      ratingCount,
+      completedJobs,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    await db.collection('users').doc(providerId).set(
+      { publicStats },
+      { merge: true },
+    );
+
+    return res.json({ ok: true, providerId, publicStats });
+  } catch (err) {
+    console.error('Provider stats recompute error:', err);
+    return res.status(500).json({
+      error: 'Provider stats recompute failed',
+      details: err?.message ?? String(err),
+    });
+  }
+});
+
+function payfastMd5(input) {
+  return crypto.createHash('md5').update(String(input), 'utf8').digest('hex');
+}
+
+function payfastSignature(params, passphrase) {
+  const pairs = [];
+  const keys = Object.keys(params || {})
+    .filter((k) => k !== 'signature')
+    .sort();
+
+  for (const k of keys) {
+    const v = params[k];
+    if (v == null) continue;
+    const s = String(v);
+    if (s.trim().length === 0) continue;
+    pairs.push(`${querystring.escape(k)}=${querystring.escape(s)}`);
+  }
+
+  if (passphrase && String(passphrase).trim().length > 0) {
+    pairs.push(`passphrase=${querystring.escape(String(passphrase))}`);
+  }
+
+  return payfastMd5(pairs.join('&'));
+}
+
+function payfastProcessUrl() {
+  const env = String(process.env.PAYFAST_ENV || '').trim().toLowerCase();
+  if (env === 'sandbox') {
+    return 'https://sandbox.payfast.co.za/eng/process';
+  }
+  return 'https://www.payfast.co.za/eng/process';
+}
+
+function baseUrlFromReq(req) {
+  const proto = req.headers['x-forwarded-proto'] || req.protocol;
+  const host = req.headers['x-forwarded-host'] || req.get('host');
+  return `${proto}://${host}`;
+}
+
+function normalizeRemoteUrl(input) {
+  if (input == null) return null;
+  const s = String(input);
+  const trimmed = s.trim();
+  if (!trimmed) return null;
+  return trimmed.replace(/\s+/g, '');
+}
+
+function assertAllowedRemoteUrl(urlString) {
+  const uri = new URL(urlString);
+
+  if (uri.protocol !== 'https:') {
+    throw new Error(`Only https URLs are allowed: ${urlString}`);
+  }
+
+  const host = String(uri.hostname || '').toLowerCase();
+  const allowed = host === 'res.cloudinary.com' || host.endsWith('.cloudinary.com');
+  if (!allowed) {
+    throw new Error(`Remote URL host not allowed: ${host}`);
+  }
+}
+
+async function downloadRemoteImageAsBase64(urlString, label) {
+  const normalized = normalizeRemoteUrl(urlString);
+  if (!normalized) {
+    throw new Error(`Missing ${label} URL`);
+  }
+
+  assertAllowedRemoteUrl(normalized);
+
+  const controller = new AbortController();
+  const timeoutMs = Number.parseInt(process.env.HTTP_DOWNLOAD_TIMEOUT_MS || '45000', 10);
+  const timer = setTimeout(() => controller.abort(), Number.isFinite(timeoutMs) ? timeoutMs : 45000);
+
+  try {
+    const resp = await fetch(normalized, {
+      method: 'GET',
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      throw new Error(`HTTP ${resp.status} while downloading ${label}: ${body}`);
+    }
+
+    const arrayBuffer = await resp.arrayBuffer();
+    const buf = Buffer.from(arrayBuffer);
+    return buf.toString('base64');
+  } catch (e) {
+    if (String(e?.name || '').toLowerCase().includes('abort')) {
+      throw new Error(`Timed out downloading ${label} from ${normalized}`);
+    }
+    throw new Error(`Could not download ${label} from ${normalized}: ${e?.message ?? String(e)}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 app.get('/__version', (req, res) => {
   res.json({
     service: 'ai-backedn',
@@ -73,6 +289,10 @@ app.get('/__version', (req, res) => {
   });
 });
 
+app.get('/_version', (req, res) => {
+  res.redirect(302, '/__version');
+});
+
 app.get('/__auth_check', authMiddleware, (req, res) => {
   res.json({
     ok: true,
@@ -81,6 +301,226 @@ app.get('/__auth_check', authMiddleware, (req, res) => {
     issuer: req.user?.iss || null,
     audience: req.user?.aud || null,
   });
+});
+
+app.post('/api/payments/payfast/checkout', authMiddleware, async (req, res) => {
+  try {
+    const type = String(req.body?.type || '').trim();
+    const bookingId = String(req.body?.bookingId || '').trim();
+    const amountRaw = req.body?.amount;
+
+    if (type !== 'booking' && type !== 'wallet_topup') {
+      return res.status(400).json({ error: 'Invalid type' });
+    }
+
+    if (type === 'booking' && !bookingId) {
+      return res.status(400).json({ error: 'bookingId is required' });
+    }
+
+    const uid = req.user?.uid;
+    if (!uid) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    let amount = null;
+    let itemName = null;
+
+    if (type === 'booking') {
+      const bookingSnap = await db.collection('bookings').doc(bookingId).get();
+      if (!bookingSnap.exists) {
+        return res.status(404).json({ error: 'Booking not found' });
+      }
+      const b = bookingSnap.data() || {};
+      const price = typeof b.price === 'number' ? b.price : Number(b.price || 0);
+      amount = Number.isFinite(price) ? price : 0;
+      itemName = `Booking ${bookingId}`;
+    } else {
+      const parsed = typeof amountRaw === 'number' ? amountRaw : Number(amountRaw);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        return res.status(400).json({ error: 'amount is required' });
+      }
+      amount = parsed;
+      itemName = 'Wallet top up';
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'Invalid amount' });
+    }
+
+    const paymentRef = db.collection('payfast_payments').doc();
+    await paymentRef.set({
+      uid,
+      type,
+      bookingId: bookingId || null,
+      amount,
+      status: 'initiated',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    const base = baseUrlFromReq(req);
+    const url = `${base}/payfast/redirect/${paymentRef.id}`;
+    return res.json({ url });
+  } catch (err) {
+    console.error('PayFast checkout error:', err);
+    return res.status(500).json({
+      error: 'Could not create PayFast checkout',
+      details: err?.message ?? String(err),
+    });
+  }
+});
+
+app.get('/payfast/redirect/:paymentId', async (req, res) => {
+  try {
+    const paymentId = String(req.params.paymentId || '').trim();
+    if (!paymentId) {
+      return res.status(400).send('Missing paymentId');
+    }
+
+    const snap = await db.collection('payfast_payments').doc(paymentId).get();
+    if (!snap.exists) {
+      return res.status(404).send('Payment not found');
+    }
+
+    const data = snap.data() || {};
+
+    const merchantId = String(process.env.PAYFAST_MERCHANT_ID || '').trim();
+    const merchantKey = String(process.env.PAYFAST_MERCHANT_KEY || '').trim();
+    const passphrase = String(process.env.PAYFAST_PASSPHRASE || '').trim();
+
+    if (!merchantId || !merchantKey) {
+      return res.status(500).send('PayFast is not configured');
+    }
+
+    const base = baseUrlFromReq(req);
+    const notifyUrl = String(process.env.PAYFAST_NOTIFY_URL || '').trim() || `${base}/api/payments/payfast/itn`;
+    const returnUrl = String(process.env.PAYFAST_RETURN_URL || '').trim() || `${base}/payfast/return`;
+    const cancelUrl = String(process.env.PAYFAST_CANCEL_URL || '').trim() || `${base}/payfast/cancel`;
+
+    const amount = Number(data.amount || 0);
+    const itemName = data.type === 'booking'
+      ? `Booking ${data.bookingId || ''}`
+      : 'Wallet top up';
+
+    const params = {
+      merchant_id: merchantId,
+      merchant_key: merchantKey,
+      return_url: returnUrl,
+      cancel_url: cancelUrl,
+      notify_url: notifyUrl,
+      m_payment_id: paymentId,
+      amount: amount.toFixed(2),
+      item_name: itemName,
+      custom_str1: String(data.uid || ''),
+      custom_str2: String(data.bookingId || ''),
+    };
+
+    const signature = payfastSignature(params, passphrase);
+    params.signature = signature;
+
+    const action = payfastProcessUrl();
+
+    const inputs = Object.keys(params)
+      .map((k) => {
+        const v = String(params[k] ?? '');
+        const safeKey = String(k)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#039;');
+        const safeVal = v
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#039;');
+        return `<input type="hidden" name="${safeKey}" value="${safeVal}" />`;
+      })
+      .join('');
+
+    const html = `<!doctype html><html><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Redirecting…</title></head><body><form id="pf" method="post" action="${action}">${inputs}</form><script>document.getElementById('pf').submit();</script></body></html>`;
+    res.set('Content-Type', 'text/html');
+    return res.status(200).send(html);
+  } catch (err) {
+    console.error('PayFast redirect error:', err);
+    return res.status(500).send('Could not redirect to PayFast');
+  }
+});
+
+app.get('/payfast/return', async (req, res) => {
+  return res.status(200).send('Payment submitted. You may return to the app and refresh.');
+});
+
+app.get('/payfast/cancel', async (req, res) => {
+  return res.status(200).send('Payment cancelled. You may return to the app.');
+});
+
+app.post('/api/payments/payfast/itn', async (req, res) => {
+  try {
+    const passphrase = String(process.env.PAYFAST_PASSPHRASE || '').trim();
+    const payload = req.body || {};
+    const receivedSignature = String(payload.signature || '').trim();
+    const paymentId = String(payload.m_payment_id || '').trim();
+
+    if (!paymentId) {
+      return res.status(400).send('Missing m_payment_id');
+    }
+
+    const expectedSignature = payfastSignature(payload, passphrase);
+    if (!receivedSignature || receivedSignature !== expectedSignature) {
+      return res.status(400).send('Invalid signature');
+    }
+
+    const paymentRef = db.collection('payfast_payments').doc(paymentId);
+    const snap = await paymentRef.get();
+    if (!snap.exists) {
+      return res.status(404).send('Payment not found');
+    }
+
+    const payment = snap.data() || {};
+    const status = String(payload.payment_status || '').trim();
+
+    await paymentRef.set(
+      {
+        status: status || payment.status || 'unknown',
+        payfast: payload,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+
+    if (status === 'COMPLETE') {
+      const amountGrossRaw = payload.amount_gross ?? payload.amount;
+      const amountGross = typeof amountGrossRaw === 'number' ? amountGrossRaw : Number(amountGrossRaw);
+      const amount = Number(payment.amount || amountGross || 0);
+
+      if (payment.type === 'booking' && payment.bookingId) {
+        await db.collection('bookings').doc(payment.bookingId).set(
+          {
+            paymentStatus: 'Paid',
+            paymentMethod: 'PayFast',
+            paymentAmount: amount,
+            paidAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+      }
+
+      if (payment.type === 'wallet_topup' && payment.uid) {
+        await db.collection('users').doc(payment.uid).set(
+          {
+            walletBalance: admin.firestore.FieldValue.increment(amount),
+          },
+          { merge: true },
+        );
+      }
+    }
+
+    return res.status(200).send('OK');
+  } catch (err) {
+    console.error('PayFast ITN error:', err);
+    return res.status(500).send('ERROR');
+  }
 });
 
 // Python Bridge: runKycEngine
@@ -479,22 +919,50 @@ function extractCnicInfo({ frontLines = [], backLines = [] }) {
 
 app.post('/api/vision/verify-cnic', authMiddleware, async (req, res) => {
   try {
-    const { cnicFrontBase64, cnicBackBase64, expectedName, expectedFatherName, expectedDob } = req.body;
-    if (!cnicFrontBase64) {
-      return res.status(400).json({ error: 'cnicFrontBase64 is required' });
+    const {
+      cnicFrontBase64,
+      cnicBackBase64,
+      cnicFrontUrl,
+      cnicBackUrl,
+      expectedName,
+      expectedFatherName,
+      expectedDob,
+    } = req.body || {};
+
+    let resolvedFrontBase64 = cnicFrontBase64;
+    if (!resolvedFrontBase64 && cnicFrontUrl) {
+      resolvedFrontBase64 = await downloadRemoteImageAsBase64(cnicFrontUrl, 'CNIC front image');
+    }
+
+    if (!resolvedFrontBase64) {
+      return res.status(400).json({
+        error: 'cnicFrontBase64 or cnicFrontUrl is required',
+        errorCode: 'MISSING_CNIC_FRONT',
+      });
     }
 
     console.log("Processing CNIC via Local Engine...");
     const frontResult = await runKycEngine('cnic', {
-      image: normalizeBase64(cnicFrontBase64),
+      image: normalizeBase64(resolvedFrontBase64),
     });
 
     let backResult = null;
     let backError = null;
-    if (cnicBackBase64) {
+    let resolvedBackBase64 = cnicBackBase64;
+    if (!resolvedBackBase64 && cnicBackUrl) {
+      try {
+        resolvedBackBase64 = await downloadRemoteImageAsBase64(cnicBackUrl, 'CNIC back image');
+      } catch (e) {
+        resolvedBackBase64 = null;
+        backError = e?.message ?? String(e);
+        console.warn('CNIC back download failed (continuing with front only):', backError);
+      }
+    }
+
+    if (resolvedBackBase64) {
       try {
         backResult = await runKycEngine('cnic', {
-          image: normalizeBase64(cnicBackBase64),
+          image: normalizeBase64(resolvedBackBase64),
         });
       } catch (e) {
         backError = e?.message ?? String(e);
@@ -648,13 +1116,35 @@ app.post('/api/vision/verify-cnic', authMiddleware, async (req, res) => {
 // 2. Face Verification
 app.post('/api/kyc/face', authMiddleware, async (req, res) => {
   try {
-    const { cnicImage, selfieImage } = req.body;
-    if (!cnicImage || !selfieImage) {
-      return res.status(400).json({ error: 'cnicImage and selfieImage required' });
+    const {
+      cnicImage,
+      selfieImage,
+      cnicImageUrl,
+      selfieImageUrl,
+    } = req.body || {};
+
+    let resolvedCnic = cnicImage;
+    if (!resolvedCnic && cnicImageUrl) {
+      resolvedCnic = await downloadRemoteImageAsBase64(cnicImageUrl, 'CNIC image');
+    }
+
+    let resolvedSelfie = selfieImage;
+    if (!resolvedSelfie && selfieImageUrl) {
+      resolvedSelfie = await downloadRemoteImageAsBase64(selfieImageUrl, 'selfie image');
+    }
+
+    if (!resolvedCnic || !resolvedSelfie) {
+      return res.status(400).json({
+        error: 'cnicImage/selfieImage (base64) or cnicImageUrl/selfieImageUrl is required',
+        errorCode: 'MISSING_FACE_INPUTS',
+      });
     }
 
     console.log("Verifying Face via Local Engine...");
-    const faceResult = await runKycEngine('face', { image: normalizeBase64(cnicImage), image2: normalizeBase64(selfieImage) });
+    const faceResult = await runKycEngine('face', {
+      image: normalizeBase64(resolvedCnic),
+      image2: normalizeBase64(resolvedSelfie),
+    });
 
     // Fetch previously extracted CNIC data for cross-matching
     let cnicData = null;
@@ -737,13 +1227,22 @@ app.post('/api/kyc/face', authMiddleware, async (req, res) => {
 // 3. Shop/Tool Verification
 app.post('/api/kyc/shop', authMiddleware, async (req, res) => {
   try {
-    const { shopImage } = req.body;
-    if (!shopImage) {
-      return res.status(400).json({ error: 'shopImage is required' });
+    const { shopImage, shopImageUrl } = req.body || {};
+
+    let resolvedShop = shopImage;
+    if (!resolvedShop && shopImageUrl) {
+      resolvedShop = await downloadRemoteImageAsBase64(shopImageUrl, 'shop image');
+    }
+
+    if (!resolvedShop) {
+      return res.status(400).json({
+        error: 'shopImage (base64) or shopImageUrl is required',
+        errorCode: 'MISSING_SHOP_IMAGE',
+      });
     }
 
     console.log("Verifying Shop via Local Engine...");
-    const result = await runKycEngine('shop', { image: normalizeBase64(shopImage) });
+    const result = await runKycEngine('shop', { image: normalizeBase64(resolvedShop) });
 
     const status = typeof result?.status === 'string'
       ? result.status
